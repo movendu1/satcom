@@ -1,77 +1,129 @@
-from skyfield.api import load, EarthSatellite, wgs84
+import numpy as np
 import pandas as pd
-import random
-from datetime import timedelta
 
-# Load timescale
-ts = load.timescale()
-t0 = ts.now()
+# -------------------------------
+# Constants
+# -------------------------------
+C = 3e8                     # Speed of light (m/s)
+EARTH_RADIUS = 6371         # km
+MU = 398600.4418            # km^3/s^2 (Earth gravitational parameter)
+FREQ_HZ = 12e9              # 12 GHz Ku-band
+TX_POWER_DBM = 40           # Satellite transmit power
+TX_GAIN_DB = 30
+RX_GAIN_DB = 35
+SYSTEM_LOSS_DB = 2
 
-# Load satellites
-def load_tle(file):
-    sats = []
-    with open(file) as f:
-        lines = f.readlines()
-        for i in range(0, len(lines), 3):
-            sats.append(EarthSatellite(
-                lines[i+1].strip(),
-                lines[i+2].strip(),
-                lines[i].strip(),
-                ts
-            ))
-    return sats
-
-leo_sats = load_tle("data/tle/leo_starlink.tle") + load_tle("data/tle/leo_iridium.tle")
-meo_sats = load_tle("data/tle/meo_gps.tle") + load_tle("data/tle/meo_galileo.tle")
-
-
-# Ground stations
-stations = {
-    "DELHI": wgs84.latlon(28.6, 77.2),
-    "SINGAPORE": wgs84.latlon(1.3, 103.8),
-    "LONDON": wgs84.latlon(51.5, -0.1),
-    "CALIFORNIA": wgs84.latlon(37.3, -121.9),
+# -------------------------------
+# Ground Stations
+# -------------------------------
+GROUND_STATIONS = {
+    "Bangalore": (12.97, 77.59),
+    "Delhi": (28.61, 77.20),
+    "Mumbai": (19.07, 72.87),
+    "Chennai": (13.08, 80.27),
+    "Kolkata": (22.57, 88.36)
 }
 
-rows = []
+# -------------------------------
+# Helper Functions
+# -------------------------------
+def haversine(lat1, lon1, lat2, lon2):
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat/2)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2)**2
+    return 2 * EARTH_RADIUS * np.arcsin(np.sqrt(a))
 
-for sat in leo_sats + meo_sats:
-    orbit_type = "LEO" if sat in leo_sats else "MEO"
+def elevation_angle(distance_km, sat_alt_km):
+    return np.degrees(np.arctan(sat_alt_km / distance_km))
 
-    for station_name, gs in stations.items():
-        for i in range(5):
-            t = t0 + timedelta(minutes=random.randint(0, 1440))
-            sat_pos = sat.at(t)
-            difference = sat_pos - gs.at(t)
+def doppler_shift(relative_velocity):
+    return (relative_velocity / C) * FREQ_HZ
 
-            alt, az, dist = difference.altaz()
+def free_space_path_loss(distance_km):
+    return 32.44 + 20*np.log10(distance_km) + 20*np.log10(FREQ_HZ/1e6)
 
-            elevation = alt.degrees
-            distance = dist.km
+def atmospheric_loss(elevation):
+    if elevation > 60:
+        return 0.5
+    elif elevation > 30:
+        return 1.5
+    else:
+        return 3.0
 
-            # REALISTIC LINK CONDITION
-            good_link = int(
-                elevation > 10 and
-                (distance < 25000 if orbit_type == "MEO" else distance < 3000)
-            )
+# -------------------------------
+# Dataset Generator
+# -------------------------------
+def generate_dataset(samples=3000):
+    rows = []
 
-            rows.append([
-                orbit_type,
-                elevation,
-                distance,
-                gs.latitude.degrees,
-                gs.longitude.degrees,
-                good_link
-            ])
+    for _ in range(samples):
+        # Orbit parameters
+        orbit_type = np.random.choice(["LEO", "MEO", "GEO"])
+        if orbit_type == "LEO":
+            alt_km = np.random.uniform(500, 1200)
+            velocity = 7.6e3
+        elif orbit_type == "MEO":
+            alt_km = np.random.uniform(8000, 20000)
+            velocity = 3.9e3
+        else:
+            alt_km = 35786
+            velocity = 3.07e3
 
-df = pd.DataFrame(rows, columns=[
-    "orbit_type",
-    "elevation",
-    "distance_km",
-    "gs_lat",
-    "gs_lon",
-    "good_link"
-])
+        sat_lat = np.random.uniform(-60, 60)
+        sat_lon = np.random.uniform(-180, 180)
 
-df.to_csv("satcom_dataset.csv", index=False)
-print("Dataset generated: satcom_dataset.csv")
+        for station, (gs_lat, gs_lon) in GROUND_STATIONS.items():
+            distance_km = haversine(sat_lat, sat_lon, gs_lat, gs_lon)
+            elevation = elevation_angle(distance_km, alt_km)
+
+            if elevation < 5:
+                visible = 0
+            else:
+                visible = 1
+
+            fspl = free_space_path_loss(distance_km)
+            atm_loss = atmospheric_loss(elevation)
+            rx_power = TX_POWER_DBM + TX_GAIN_DB + RX_GAIN_DB - fspl - atm_loss - SYSTEM_LOSS_DB
+
+            doppler = doppler_shift(velocity * np.cos(np.radians(elevation)))
+
+            rows.append({
+                "orbit_type": orbit_type,
+                "sat_altitude_km": alt_km,
+                "sat_lat": sat_lat,
+                "sat_lon": sat_lon,
+                "gs_lat": gs_lat,
+                "gs_lon": gs_lon,
+                "distance_km": distance_km,
+                "elevation": elevation,
+                "doppler_hz": doppler,
+                "fspl_db": fspl,
+                "atm_loss_db": atm_loss,
+                "rx_power_dbm": rx_power,
+                "visible": visible,
+                "station": station
+            })
+
+    df = pd.DataFrame(rows)
+
+    # -------------------------------
+    # Feature Engineering
+    # -------------------------------
+    df["sin_elevation"] = np.sin(np.radians(df["elevation"]))
+    df["cos_elevation"] = np.cos(np.radians(df["elevation"]))
+    df["distance_log"] = np.log1p(df["distance_km"])
+    df["rx_margin"] = df["rx_power_dbm"] + 100
+    df["orbit_type_enc"] = df["orbit_type"].map({"LEO": 0, "MEO": 1, "GEO": 2})
+
+    return df
+
+# -------------------------------
+# Run Generator
+# -------------------------------
+if __name__ == "__main__":
+    df = generate_dataset(samples=1000)
+    df.to_csv("satcom_training_dataset.csv", index=False)
+    print("✅ Dataset generated: satcom_training_dataset.csv")
+    print(df.head())
+
